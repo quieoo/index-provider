@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"time"
 
+	"github.com/ipfs/boxo/routing/http/types"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
@@ -251,6 +253,39 @@ func (dsw *dsWrapper) recordTimestampsSnapshot(ctx context.Context, timestamps [
 
 func (dsw *dsWrapper) recordCidTimestamp(ctx context.Context, c cid.Cid, t time.Time) error {
 	return dsw.ds.Put(ctx, timestampByCidKey(c), int64ToBytes(t.UnixMilli()))
+}
+
+func (ds *dsWrapper) putProviderRecord(ctx context.Context, cid cid.Cid, providerRecord *types.PeerRecord) error {
+	key := datastore.NewKey(cid.String())
+
+	// 将 PeerRecord 序列化为 JSON 以便存储
+	value, err := json.Marshal(providerRecord)
+	if err != nil {
+		return err
+	}
+
+	// 将序列化后的值存储到 datastore
+	return ds.ds.Put(ctx, key, value)
+}
+
+func (ds *dsWrapper) getProviderRecord(ctx context.Context, cid cid.Cid) (*types.PeerRecord, error) {
+	key := datastore.NewKey(cid.String())
+	// 从 datastore 获取数据ds
+	value, err := ds.ds.Get(ctx, key)
+	if err != nil {
+		if err == datastore.ErrNotFound {
+			return nil, fmt.Errorf("provider record not found for CID: %s", cid.String())
+		}
+		return nil, err
+	}
+
+	// 将字节数据反序列化为 PeerRecord
+	var providerRecord types.PeerRecord
+	err = json.Unmarshal(value, &providerRecord)
+	if err != nil {
+		return nil, err
+	}
+	return &providerRecord, nil
 }
 
 func (dsw *dsWrapper) getCidTimestamp(ctx context.Context, c cid.Cid) (time.Time, error) {

@@ -74,8 +74,10 @@ Listener.New.
 index-provider periodically reports its operational stats from Listener.stats (number of Advertisements sent, number of CIDs under management and etc.).
 */
 
-var log = logging.Logger("delegatedrouting/listener")
-var bitswapMetadata = metadata.Default.New(metadata.Bitswap{})
+var (
+	log             = logging.Logger("delegatedrouting/listener")
+	bitswapMetadata = metadata.Default.New(metadata.Bitswap{})
+)
 
 const (
 	// keeping this as "reframe" for backwards compatibility
@@ -123,7 +125,6 @@ type MultihashLister struct {
 func (lister *MultihashLister) MultihashLister(ctx context.Context, p peer.ID, contextID []byte) (provider.MultihashIterator, error) {
 	contextIdStr := contextIDToStr(contextID)
 	cids, err := lister.CidFetcher(contextID)
-
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +156,6 @@ func New(ctx context.Context, engine provider.Interface,
 	nonceGen func() []byte,
 	opts ...Option,
 ) (*Listener, error) {
-
 	options := ApplyOptions(opts...)
 
 	cctx, cancelFunc := context.WithCancel(ctx)
@@ -224,9 +224,7 @@ func New(ctx context.Context, engine provider.Interface,
 			// expire from the index-provider just at a later date.
 			listener.cidQueue.recordCidNode(&cidNode{C: c, Timestamp: now, chunk: chunk})
 		}
-
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -290,8 +288,35 @@ func (listener *Listener) FindPeers(ctx context.Context, pid peer.ID, limit int)
 }
 
 func (listener *Listener) FindProviders(ctx context.Context, key cid.Cid, limit int) (iter.ResultIter[types.Record], error) {
-	log.Warn("Received unsupported FindProviders request")
-	return nil, errors.New("unsupported find providers request")
+	log.Infof("Finding providers for CID: %s", key.String())
+
+	// 从 datastore 中获取 provider 记录
+	providerRecord, err := listener.dsWrapper.getProviderRecord(ctx, key)
+	if err != nil {
+		log.Warnf("No provider found for CID: %s", key.String())
+		return nil, err
+	}
+
+	// 构建返回的记录，确保返回的是 PeerRecord 类型
+	records := []*types.PeerRecord{
+		{
+			Schema:    providerRecord.Schema,
+			ID:        providerRecord.ID,
+			Addrs:     providerRecord.Addrs,
+			Protocols: providerRecord.Protocols,
+			Extra:     providerRecord.Extra,
+		},
+	}
+
+	fmt.Printf("key %s, PeerID: %s, Addrs: %v, Protocols: %v\n", key.String(), providerRecord.ID, providerRecord.Addrs, providerRecord.Protocols)
+
+	// 使用 Map 将 PeerRecord 转换为 types.Record
+	recordIter := iter.Map(iter.FromSlice(records), func(r *types.PeerRecord) types.Record {
+		return r // 由于 PeerRecord 实现了 Record 接口，直接返回
+	})
+
+	// 使用 ToResultIter 将 SliceIter 转换为 ResultIter
+	return iter.ToResultIter(recordIter), nil
 }
 
 func (listener *Listener) ProvideBitswap(ctx context.Context, req *server.BitswapWriteProvideRequest) (time.Duration, error) {
@@ -319,74 +344,92 @@ func (listener *Listener) ProvideBitswap(ctx context.Context, req *server.Bitswa
 		return 0, fmt.Errorf("provider %s isn't allowed", pid)
 	}
 
-	if len(listener.lastSeenProviderInfo.ID) > 0 && listener.lastSeenProviderInfo.ID != pid {
-		log.Warnw("Skipping Provide request as its provider is different from the last seen one.", "lastSeen", listener.lastSeenProviderInfo.ID, "received", pid)
-		return 0, fmt.Errorf("provider %s isn't allowed", pid)
-	}
+	// if len(listener.lastSeenProviderInfo.ID) > 0 && listener.lastSeenProviderInfo.ID != pid {
+	// 	log.Warnw("Skipping Provide request as its provider is different from the last seen one.", "lastSeen", listener.lastSeenProviderInfo.ID, "received", pid)
+	// 	return 0, fmt.Errorf("provider %s isn't allowed", pid)
+	// }
 
 	listener.lastSeenProviderInfo.ID = pid
 	listener.lastSeenProviderInfo.Addrs = paddrs
 
-	for i, c := range cids {
-		// persisting timestamp only if this is not a snapshot
-		if len(cids) < listener.snapshotSize {
-			err := listener.dsWrapper.recordCidTimestamp(ctx, c, startTime)
-			if err != nil {
-				log.Errorw("Error persisting timestamp. Continuing.", "cid", c, "err", err)
-				continue
-			}
+	for _, c := range cids {
+		var typesAddrs []types.Multiaddr
+		for _, addr := range paddrs {
+			typesAddrs = append(typesAddrs, types.Multiaddr{Multiaddr: addr})
+		}
+		providerRecord := &types.PeerRecord{
+			Schema:    types.SchemaPeer,
+			ID:        &pid,
+			Addrs:     typesAddrs,
+			Protocols: []string{"bitswap"}, // 假设支持 bitswap 协议
+			Extra:     nil,                 // 如果有额外信息，可以在这里添加
+		}
+		// fmt.Printf("PROVIDE key %s, PeerID: %s, Addrs: %v, Protocols: %v\n", c.String(), providerRecord.ID, providerRecord.Addrs, providerRecord.Protocols)
+		// 将 CID 和节点信息存储在 datastore 中
+		err := listener.dsWrapper.putProviderRecord(ctx, c, providerRecord)
+		if err != nil {
+			log.Errorw("Error storing provider info.", "cid", c, "err", err)
 		}
 
-		listElem := listener.cidQueue.getNodeByCid(c)
-		if listElem == nil {
-			listener.cidQueue.recordCidNode(&cidNode{
-				C:         c,
-				Timestamp: startTime,
-			})
-			err := listener.chunker.addCidToCurrentChunk(ctx, c, func(cc *cidsChunk) error {
-				return listener.notifyPutAndPersist(ctx, cc)
-			})
-			if err != nil {
-				log.Errorw("Error adding a cid to the current chunk. Continuing.", "cid", c, "err", err)
-				listener.cidQueue.removeCidNode(c)
-				continue
-			}
-		} else {
-			node := listElem.Value.(*cidNode)
-			node.Timestamp = startTime
-			listener.cidQueue.recordCidNode(node)
-			// if no existing chunk has been found for the cid - adding it to the current one
-			// This can happen in the following cases:
-			//     * when currentChunk disappears between restarts as it doesn't get persisted until it's advertised
-			//     * when the same cid comes multiple times within the lifespan of the same chunk
-			//	   * after a error to generate a replacement chunk
-			if node.chunk == nil {
-				err := listener.chunker.addCidToCurrentChunk(ctx, c, func(cc *cidsChunk) error {
-					return listener.notifyPutAndPersist(ctx, cc)
-				})
-				if err != nil {
-					log.Errorw("Error adding a cid to the current chunk. Continuing.", "cid", c, "err", err)
-					continue
-				}
-			}
-			listener.stats.incExistingCidsProcessed()
-		}
+		// // persisting timestamp only if this is not a snapshot
+		// if len(cids) < listener.snapshotSize {
+		// 	err := listener.dsWrapper.recordCidTimestamp(ctx, c, startTime)
+		// 	if err != nil {
+		// 		log.Errorw("Error persisting timestamp. Continuing.", "cid", c, "err", err)
+		// 		continue
+		// 	}
+		// }
 
-		listener.stats.incCidsProcessed()
-		// Doing some logging for larger requests
-		if i != 0 && i%printFrequency == 0 {
-			log.Infof("Processed %d out of %d CIDs. startTime=%v", i, len(cids), startTime)
-		}
-	}
-	removedSomething, err := listener.removeExpiredCids(ctx)
-	if err != nil {
-		log.Warnw("Error removing expired cids.", "err", err)
-	}
+		// listElem := listener.cidQueue.getNodeByCid(c)
+		// if listElem == nil {
+		// 	listener.cidQueue.recordCidNode(&cidNode{
+		// 		C:         c,
+		// 		Timestamp: startTime,
+		// 	})
+		// 	err := listener.chunker.addCidToCurrentChunk(ctx, c, func(cc *cidsChunk) error {
+		// 		return listener.notifyPutAndPersist(ctx, cc)
+		// 	})
+		// 	if err != nil {
+		// 		log.Errorw("Error adding a cid to the current chunk. Continuing.", "cid", c, "err", err)
+		// 		listener.cidQueue.removeCidNode(c)
+		// 		continue
+		// 	}
+		// } else {
+		// 	node := listElem.Value.(*cidNode)
+		// 	node.Timestamp = startTime
+		// 	listener.cidQueue.recordCidNode(node)
+		// 	// if no existing chunk has been found for the cid - adding it to the current one
+		// 	// This can happen in the following cases:
+		// 	//     * when currentChunk disappears between restarts as it doesn't get persisted until it's advertised
+		// 	//     * when the same cid comes multiple times within the lifespan of the same chunk
+		// 	//	   * after a error to generate a replacement chunk
+		// 	if node.chunk == nil {
+		// 		err := listener.chunker.addCidToCurrentChunk(ctx, c, func(cc *cidsChunk) error {
+		// 			return listener.notifyPutAndPersist(ctx, cc)
+		// 		})
+		// 		if err != nil {
+		// 			log.Errorw("Error adding a cid to the current chunk. Continuing.", "cid", c, "err", err)
+		// 			continue
+		// 		}
+		// 	}
+		// 	listener.stats.incExistingCidsProcessed()
+		// }
 
-	// if that was a snapshot or some cids have expired - persisting timestamps as binary blob
-	if removedSomething || len(cids) >= listener.snapshotSize {
-		listener.dsWrapper.recordTimestampsSnapshot(ctx, listener.cidQueue.getTimestampsSnapshot())
+		// listener.stats.incCidsProcessed()
+		// // Doing some logging for larger requests
+		// if i != 0 && i%printFrequency == 0 {
+		// 	log.Infof("Processed %d out of %d CIDs. startTime=%v", i, len(cids), startTime)
+		// }
 	}
+	// removedSomething, err := listener.removeExpiredCids(ctx)
+	// if err != nil {
+	// 	log.Warnw("Error removing expired cids.", "err", err)
+	// }
+
+	// // if that was a snapshot or some cids have expired - persisting timestamps as binary blob
+	// if removedSomething || len(cids) >= listener.snapshotSize {
+	// 	listener.dsWrapper.recordTimestampsSnapshot(ctx, listener.cidQueue.getTimestampsSnapshot())
+	// }
 	return time.Duration(listener.cidTtl), nil
 }
 
@@ -499,7 +542,6 @@ func (listener *Listener) notifyRemoveAndPersist(ctx context.Context, chunk *cid
 		}
 		return e
 	}, retryWithBackoffInterval, retryWithBackoffMaxAttempts)
-
 	if err != nil {
 		return err
 	}
@@ -533,7 +575,6 @@ func (listener *Listener) notifyPutAndPersist(ctx context.Context, chunk *cidsCh
 		}
 		return e
 	}, retryWithBackoffInterval, retryWithBackoffMaxAttempts)
-
 	if err != nil {
 		// if there was an error - reverting index update
 		listener.chunker.removeChunk(chunk)
